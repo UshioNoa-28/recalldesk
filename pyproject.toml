@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "recalldesk"
+version = "0.2.0"
+description = "Hybrid (dense + BM25) RAG service on Qdrant and PostgreSQL, with a retrieval evaluation harness"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "alembic>=1.13,<2.0",
+    "asyncpg>=0.30,<1.0",
+    "dishka>=1.5,<2.0",
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.34,<1.0",
+    "python-multipart>=0.0.20,<1.0",
+    "pypdf>=5,<7",
+    "pydantic-settings>=2.7,<3.0",
+    "sqlalchemy[asyncio]>=2.0,<3.0",
+    "qdrant-client>=1.16,<1.19",
+    "redis>=5.0,<6.0",
+    "httpx>=0.27,<1.0",
+    "llama-index-core>=0.12,<1.0",
+    "llama-index-embeddings-openai>=0.3,<1.0",
+    "llama-index-llms-openai-like>=0.3,<1.0",
+]
+
+[tool.setuptools]
+py-modules = ["settings"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: 需要真实 PostgreSQL / Qdrant 服务的测试，默认不跑（pytest -m integration 显式运行）",
+]
+addopts = "-m 'not integration'"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# 显式列出规则集：默认 select 会随 ruff 版本变，下面那几个 ignore 也就跟着落空
+select = ["E", "W", "F", "I", "B", "C4", "UP", "S", "BLE", "RUF"]
+ignore = [
+    # RUF001-003：中文注释和文案里的全角标点会被当成「易混 Unicode 字符」，全仓刷屏
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # B008：FastAPI 依赖默认值（File(...) / 请求模型实例）是框架惯用法
+    "B008",
+    # BLE001：worker 消费循环刻意兜底所有异常（业务失败要落库而不是崩进程）
+    "BLE001",
+    # S110：best-effort 补偿路径（文件删除失败只记日志，不影响主流程）
+    "S110",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里 assert 就是断言手段，类级别放假数据是 unittest 的常规写法
+"tests/*" = ["S101", "RUF012"]
+# 迁移脚本是 alembic 模板生成的历史记录，不为过 lint 去重排老文件
+"migrations/versions/*" = ["E501", "I001"]

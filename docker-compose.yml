@@ -1,0 +1,156 @@
+x-app: &app
+  build: .
+  image: recalldesk:latest
+  restart: unless-stopped
+  # 业务参数统一走 .env（cp .env.example .env 后生效），这里只覆盖「地址类」变量：
+  # .env 里的地址是给宿主机直跑进程用的（127.0.0.1 + 映射端口），容器里必须指向服务名 /
+  # host.docker.internal。environment 优先级高于 env_file，下面的覆盖会赢。
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql+asyncpg://rag:rag@postgres:5432/anna_rag
+    REDIS_URL: redis://redis:6379/0
+    QDRANT_URL: http://qdrant:6333
+    # Ollama 跑在宿主机：容器内 127.0.0.1 是容器自己，必须走 host.docker.internal
+    EMBEDDING_BASE_URL: http://host.docker.internal:11434/v1
+    RERANK_OLLAMA_URL: http://host.docker.internal:11434
+    DATA_DIR: /app/data
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: recalldesk-postgres
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB: anna_rag
+    ports:
+      - "5435:5432"
+    volumes:
+      - anna_rag_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d anna_rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: recalldesk-redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - anna_rag_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.18.3
+    container_name: recalldesk-qdrant
+    ports:
+      - "127.0.0.1:6335:6333"
+      - "127.0.0.1:6336:6334"
+    volumes:
+      - anna_rag_qdrant:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333'"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  api:
+    <<: *app
+    container_name: recalldesk-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8001:8000"
+    volumes:
+      - anna_rag_documents:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  publisher:
+    <<: *app
+    container_name: recalldesk-publisher
+    command: python -m app.publisher.document
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  consumer:
+    <<: *app
+    container_name: recalldesk-consumer
+    command: python -m app.consumer.document
+    volumes:
+      - anna_rag_documents:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  eval-publisher:
+    <<: *app
+    container_name: recalldesk-eval-publisher
+    command: python -m app.publisher.eval
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  eval-consumer:
+    <<: *app
+    container_name: recalldesk-eval-consumer
+    command: python -m app.consumer.eval
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: recalldesk-frontend:latest
+    container_name: recalldesk-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  anna_rag_postgres:
+  anna_rag_redis:
+  anna_rag_qdrant:
+  anna_rag_documents:
