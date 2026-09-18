@@ -1,0 +1,234 @@
+x-app: &app
+  build: .
+  image: recalldesk:latest
+  restart: unless-stopped
+  # 开发期热更新：`docker compose watch`（或 up --watch）盯着工作区——
+  # 改 app/ 代码直接同步进容器并重启进程，不再需要 --build 重建镜像；
+  # 只有 pyproject/依赖/镜像本身变了才走 rebuild。
+  develop:
+    watch:
+      - path: ./app
+        action: sync+restart
+        target: /app/app
+      - path: ./settings.py
+        action: sync+restart
+        target: /app/settings.py
+      - path: ./migrations
+        action: sync+restart
+        target: /app/migrations
+      - path: ./pyproject.toml
+        action: rebuild
+  # 业务参数统一走 .env（cp .env.example .env 后生效），这里只覆盖「地址类」变量：
+  # .env 里的地址是给宿主机直跑进程用的（127.0.0.1 + 映射端口），容器里必须指向服务名 /
+  # host.docker.internal。environment 优先级高于 env_file，下面的覆盖会赢。
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql+asyncpg://rag:rag@postgres:5432/anna_rag
+    REDIS_URL: redis://redis:6379/0
+    NEO4J_URI: bolt://neo4j:7687
+    NEO4J_USER: neo4j
+    NEO4J_PASSWORD: ${NEO4J_PASSWORD:-recalldesk}
+    # Ollama 跑在宿主机：容器内 127.0.0.1 是容器自己，必须走 host.docker.internal
+    EMBEDDING_BASE_URL: http://host.docker.internal:11434/v1
+    RERANK_OLLAMA_URL: http://host.docker.internal:11434
+    DATA_DIR: /app/data
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: recalldesk-postgres
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB: anna_rag
+    ports:
+      - "5435:5432"
+    volumes:
+      - anna_rag_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d anna_rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: recalldesk-redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - anna_rag_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  neo4j:
+    image: neo4j:5
+    container_name: recalldesk-neo4j
+    ports:
+      # 宿主机 7474/7687 已被本机另一套 Neo4j 占用，错开（同 PG 5435 / Redis 6380 的惯例）
+      - "127.0.0.1:7475:7474"
+      - "127.0.0.1:7688:7687"
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-recalldesk}
+      # 个人机器的胃口：heap 与 pagecache 都压小，默认值会在 13GB 机器上抢内存。
+      # 键名是 Neo4j 5 的（server.memory.*，点→_、下划线→__）；dbms.memory.* 是 4 的旧名，5 会拒启。
+      NEO4J_server_memory_heap_max__size: 512M
+      NEO4J_server_memory_pagecache_size: 512M
+    volumes:
+      - anna_rag_neo4j:/data
+    healthcheck:
+      # 镜像里没有 wget/curl 的把握，沿用 qdrant 那套 bash /dev/tcp 探 bolt 端口
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/7687' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  api:
+    <<: *app
+    container_name: recalldesk-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8001:8000"
+    volumes:
+      - anna_rag_documents:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  publisher:
+    <<: *app
+    container_name: recalldesk-document-publisher
+    command: python -m app.publisher.document
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  consumer:
+    <<: *app
+    container_name: recalldesk-document-consumer
+    command: python -m app.consumer.document
+    volumes:
+      - anna_rag_documents:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  eval-publisher:
+    <<: *app
+    container_name: recalldesk-eval-question-publisher
+    command: python -m app.publisher.eval
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  eval-consumer:
+    <<: *app
+    container_name: recalldesk-eval-question-consumer
+    command: python -m app.consumer.eval
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  eval-run-publisher:
+    <<: *app
+    container_name: recalldesk-eval-run-publisher
+    command: python -m app.publisher.eval_run
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  eval-run-consumer:
+    <<: *app
+    container_name: recalldesk-eval-run-consumer
+    command: python -m app.consumer.eval_run
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  graph-publisher:
+    <<: *app
+    container_name: recalldesk-graph-publisher
+    command: python -m app.publisher.graph
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  graph-consumer:
+    <<: *app
+    container_name: recalldesk-graph-consumer
+    command: python -m app.consumer.graph
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: recalldesk-frontend:latest
+    container_name: recalldesk-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  anna_rag_postgres:
+  anna_rag_redis:
+  anna_rag_neo4j:
+  anna_rag_documents:

@@ -1,0 +1,20 @@
+# 构建上下文瘦身：Dockerfile 只 COPY 这几个路径，其余一律不进上下文
+.git
+.venv
+.uv-cache
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+*.egg-info
+data
+doc
+examples
+reading_material
+frontend
+tests
+plan.md
+.env
+.env.example
+opencode.json
+uv.lock
