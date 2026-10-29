@@ -1,0 +1,144 @@
+server:
+  port: ${API_PORT:8090}
+  error:
+    # 白标错误页关掉：所有错误正文都由 ApiExceptionAdvice 产出 {"detail": ...}
+    # （FastAPI 的 HTTPException 形状），Spring 默认的 {timestamp,status,error,path} 是错的
+    whitelabel:
+      enabled: false
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"
+
+spring:
+  # ---- SMTP（验证码邮件）----
+  # QQ 邮箱：smtp.qq.com + SSL 465，口令是「授权码」而不是登录密码。
+  # 授权码只从环境变量进来（SMTP_PASSWORD），不写进仓库、不写进任何日志。
+  mail:
+    host: ${SMTP_HOST:smtp.qq.com}
+    port: ${SMTP_PORT:465}
+    username: ${SMTP_USERNAME:}
+    password: ${SMTP_PASSWORD:}
+    protocol: smtp
+    default-encoding: UTF-8
+    properties:
+      mail:
+        smtp:
+          auth: true
+          ssl:
+            enable: ${SMTP_SSL:true}
+          starttls:
+            enable: ${SMTP_STARTTLS:false}
+          connectiontimeout: 10000
+          timeout: 10000
+          writetimeout: 10000
+  application:
+    name: recalldesk
+  jackson:
+    # 契约：响应体全 snake_case，且 null 字段照旧输出（前端依赖这个形状）
+    property-naming-strategy: SNAKE_CASE
+  datasource:
+    url: ${JDBC_URL:jdbc:postgresql://127.0.0.1:5435/anna_rag}
+    username: ${DATABASE_USER:rag}
+    password: ${DATABASE_PASSWORD:rag}
+    hikari:
+      maximum-pool-size: ${DB_POOL_MAX:32}
+      # 必须显式压低：minimum-idle 不给值时 Hikari 取 maximum-pool-size，
+      # 于是每个常驻进程一启动就把整池连接建满。四个 worker 角色 + web 共 5 个进程，
+      # 5×32=160 连接远超 PG max_connections=100，起满角色即 "sorry, too many clients"。
+      minimum-idle: ${DB_POOL_MIN_IDLE:2}
+      # 每条连接一建立就打开 pgvector 的迭代式索引扫描：向量路带 user_id 过滤时，
+      # 默认的「取满 limit 再筛」会让隔离后的结果少于 limit（详见 db/schema.sql 注释）。
+      connection-init-sql: SET hnsw.iterative_scan = ${HNSW_ITERATIVE_SCAN:relaxed_order}
+  data:
+    redis:
+      host: ${REDIS_HOST:127.0.0.1}
+      port: ${REDIS_PORT:6380}
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+
+recalldesk:
+  # chunks.embedding 的维度，必须和 db/schema.sql 里的 vector(N) 一致；
+  # 每批向量回来都比一次，对不上当场报错，不留到检索时才发现结果全是空的。
+  embedding-dim: ${EMBEDDING_DIM:1024}
+  # 上传原件的落盘根目录（相对启动目录解析）：chunks 里的文本是派生物，这里才是权威
+  data-dir: ${DATA_DIR:data}
+  # 分块尺寸按「字符数」计（一个码点一个 token，中文一字一 token）
+  chunk-size: ${CHUNK_SIZE:512}
+  chunk-overlap: ${CHUNK_OVERLAP:64}
+  # 两条异步链路各有各的退避基数：第 n 次失败后等 base * 2^(n-1) 秒再重投。
+  # 一份配置喂一条链路（索引 30s、逐题评测 10s——题多、单题便宜，等不起），
+  # env 名与 TaskPolicy 的旋钮同源。
+  task:
+    retry-backoff-base-seconds: ${TASK_RETRY_BACKOFF_BASE_SECONDS:30}
+  eval-run-task:
+    retry-backoff-base-seconds: ${EVAL_RUN_TASK_RETRY_BACKOFF_BASE_SECONDS:10}
+  # ---- 两条异步链路的队列寻址与投递节奏 ----
+  # 一份配置喂一条链路的 queue / publisher / consumer（TaskPolicy 的六个旋钮），
+  # 省得两处各读同名设置、彼此漂移。env 名与 settings.py 的键逐条同源。
+  streams:
+    # 所有 Stream 队列共享的底层参数：MAXLEN ~ 裁剪上限、空闲多久算孤儿
+    maxlen: ${REDIS_STREAM_MAXLEN:10000}
+    claim-min-idle-ms: ${REDIS_CLAIM_MIN_IDLE_MS:60000}
+    document:
+      stream: ${REDIS_DOCUMENT_TASK_STREAM:anna_rag_document_tasks}
+      consumer-group: ${REDIS_DOCUMENT_CONSUMER_GROUP:anna_rag_document_workers}
+      publish-interval-seconds: ${TASK_PUBLISH_INTERVAL_SECONDS:0.5}
+      publish-batch-size: ${TASK_PUBLISH_BATCH_SIZE:50}
+      max-attempts: ${TASK_MAX_ATTEMPTS:10}
+      retry-backoff-seconds: ${TASK_RETRY_BACKOFF_BASE_SECONDS:30}
+    eval-run:
+      stream: ${REDIS_EVAL_RUN_TASK_STREAM:anna_rag_eval_run_tasks}
+      consumer-group: ${REDIS_EVAL_RUN_CONSUMER_GROUP:anna_rag_eval_run_workers}
+      # 一次任务 = 一次检索，比建索引便宜得多：投递更勤、重试预算更小
+      publish-interval-seconds: ${EVAL_RUN_TASK_PUBLISH_INTERVAL_SECONDS:1.0}
+      publish-batch-size: ${EVAL_RUN_TASK_PUBLISH_BATCH_SIZE:50}
+      max-attempts: ${EVAL_RUN_TASK_MAX_ATTEMPTS:3}
+      retry-backoff-seconds: ${EVAL_RUN_TASK_RETRY_BACKOFF_BASE_SECONDS:10}
+  # 一个进程一类角色：留空就起 web 服务；四个 worker 角色见 WorkerConfiguration
+  worker:
+    role: ${RECALLDESK_WORKER_ROLE:}
+  # ---- 鉴权：自写 JWT 过滤器（没有 Spring Security 过滤链，白名单就得自己列）----
+  # secret 缺失或短于 32 字节会在 JjwtTokenGateway 构造期抛错、启动即失败：
+  # 宁可起不来，也不要退化成「没配密钥就不验签」——那是把门拆了当门开着。
+  jwt:
+    secret: ${JWT_SECRET:}
+    access-ttl: ${JWT_ACCESS_TTL:30m}
+    refresh-ttl: ${JWT_REFRESH_TTL:14d}
+    # 逗号分隔的公开路径前缀；除了这几个，其余路由一律要 access 令牌
+    public-paths: ${JWT_PUBLIC_PATHS:/auth/email-code,/auth/register,/auth/login,/auth/refresh,/health}
+  # ---- 注册验证码 ----
+  # 码是六位数字、一次性。TTL 同时是冷却期：发码即 NX 占位，键活多久同一邮箱就锁多久。
+  auth:
+    email-code-ttl: ${EMAIL_CODE_TTL:10m}
+    # 发件人；QQ 邮箱要求 From 与登录账号一致，否则会被拒
+    mail-from: ${MAIL_FROM:}
+  # ---- 限流 ----
+  # 令牌桶的容量与回填速率写在实现里（PerUserRateLimiter / PerCredentialRateLimiter），
+  # 换算法就换实现注入；这里只留一个开关，关掉等于不注册过滤器。
+  rate-limit:
+    enabled: ${RATE_LIMIT_ENABLED:true}
+  # ---- 模型网关：Java 只认这一个地址 ----
+  # embedding / rerank / query rewrite 的模型名、prompt 与重试都在 model-service 里；
+  # 这里只留网关地址，以及两处 Java 必须自己知道的数字：向量维度、重排候选宽度。
+  model-service:
+    base-url: ${MODEL_SERVICE_URL:http://127.0.0.1:8002}
+    # 网关整体超时：CPU 上 20 个候选逐个重排可能到分钟级
+    embed-timeout-seconds: ${MODEL_EMBED_TIMEOUT_SECONDS:120}
+    rerank-timeout-seconds: ${MODEL_RERANK_TIMEOUT_SECONDS:900}
+    rewrite-timeout-seconds: ${MODEL_REWRITE_TIMEOUT_SECONDS:180}
+  rerank:
+    # 重排生效时先取多少候选（重排后再截回 top_k）
+    top-n: ${RERANK_TOP_N:20}
+  # ---- 融合默认档（交互式查询 /search 用；评测 run 一律在自己的 config 里显式带）----
+  # env 名与解析口径照抄 settings.py：fusion_weights 在那边是 dict（pydantic 按 JSON 解析），
+  # 所以这里也收 JSON 串，别写成 dense:1,sparse:1 这种自创语法。
+  fusion:
+    method: ${FUSION_METHOD:rrf}
+    rrf-k: ${FUSION_RRF_K:60}
+    norm: ${FUSION_NORM:minmax}
+    weights: '${FUSION_WEIGHTS:{"dense":1.0,"sparse":1.0}}'
+  # 交互式检索默认返回条数（评测 run 的 top_k 落在 run 自己的 config 里，不读这里）
+  top-k: ${TOP_K:5}

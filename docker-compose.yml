@@ -1,0 +1,168 @@
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: recalldesk:latest
+  restart: unless-stopped
+  # 业务参数统一走 .env（cp .env.example .env 后生效）；这里只覆盖「地址类」变量：
+  # .env 里的地址是给宿主机直跑进程用的（127.0.0.1 + 映射端口），容器里必须指向服务名。
+  # environment 优先级高于 env_file，下面的覆盖会赢。
+  env_file: .env
+  environment:
+    # Java 侧用 JDBC 串（不是 Python 时代的 postgresql+asyncpg://）
+    JDBC_URL: jdbc:postgresql://postgres:5432/anna_rag
+    DATABASE_USER: rag
+    DATABASE_PASSWORD: rag
+    REDIS_HOST: redis
+    REDIS_PORT: 6379
+    # 模型调用只认网关：Ollama 由 model 服务去连，Java 不碰
+    MODEL_SERVICE_URL: http://model:8000
+    DATA_DIR: /app/data
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    model:
+      condition: service_healthy
+
+services:
+  postgres:
+    # chunk 检索索引住在这里（pgvector HNSW + pg_search BM25），所以不能用官方 postgres 镜像：
+    # pg_search 要求服务端启动时 loaded（shared_preload_libraries），ParadeDB 镜像已烤进去。
+    # 也因此不能沿用 postgres:16 初始化过的旧数据卷——那份 PGDATA 里的 postgresql.conf
+    # 没有这行配置，扩展装不上。换镜像 = 换卷（卷名带 pg 后缀），旧卷留着当回滚点。
+    image: paradedb/paradedb:latest-pg16
+    container_name: recalldesk-postgres
+    # 默认代价参数（random_page_cost=4, effective_cache_size=64MB）会让 planner 放弃
+    # HNSW 索引、改用全表 Seq Scan + Sort：1.5 万条向量的 dense 查询从 ~8ms 变成 ~500ms。
+    command:
+      - postgres
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_cache_size=1GB
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB: anna_rag
+    ports:
+      - "5435:5432"
+    volumes:
+      - anna_rag_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d anna_rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: recalldesk-redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - anna_rag_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Ollama 也在 compose 里：模型网关按服务名连它，宿主机不用改 OLLAMA_HOST，也不暴露 11434。
+  # 模型存在 ollama_models 卷里，首次启动后要进容器 pull（见 README）。
+  ollama:
+    image: ollama/ollama:latest
+    container_name: recalldesk-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+  # 模型网关：embedding / rerank / 查询改写都从这里出，Java 只认 http://model:8000。
+  model:
+    build:
+      context: ./model-service
+      dockerfile: Dockerfile
+    image: recalldesk-model:latest
+    container_name: recalldesk-model
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+    ports:
+      - "8002:8000"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # 一个进程一类角色（见 WorkerConfiguration）：api 是 web 服务，四个 worker 各领一条链的一个角色。
+  # 角色由命令行 --recalldesk.worker.role 决定，不再有 Python 时代的六个 python -m 入口。
+  api:
+    <<: *app
+    container_name: recalldesk-api
+    ports:
+      # 只绑回环：对外唯一入口是 frontend 的 nginx（它写 X-Real-IP，限流按真实地址建桶）。
+      # 绑 0.0.0.0 的话，外部可以绕过 nginx 直连并用伪造的 X-Real-IP 换新桶。
+      - "127.0.0.1:8001:8090"
+    volumes:
+      - anna_rag_documents:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8090/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  document-publisher:
+    <<: *app
+    container_name: recalldesk-document-publisher
+    command: ["--recalldesk.worker.role=document-publisher"]
+
+  document-consumer:
+    <<: *app
+    container_name: recalldesk-document-consumer
+    command: ["--recalldesk.worker.role=document-consumer"]
+    volumes:
+      - anna_rag_documents:/app/data
+
+  eval-run-publisher:
+    <<: *app
+    container_name: recalldesk-eval-run-publisher
+    command: ["--recalldesk.worker.role=eval-run-publisher"]
+
+  eval-run-consumer:
+    <<: *app
+    container_name: recalldesk-eval-run-consumer
+    command: ["--recalldesk.worker.role=eval-run-consumer"]
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: recalldesk-frontend:latest
+    container_name: recalldesk-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  # anna_rag_pg 是 ParadeDB 镜像初始化卷；旧的 anna_rag_postgres（postgres:16 初始化）
+  # 不再被引用，留在磁盘上当回滚点，确认新栈没问题后手动 docker volume rm
+  anna_rag_pg:
+  anna_rag_redis:
+  anna_rag_documents:
+  # Ollama 的模型缓存；删卷等于所有模型重新 pull
+  ollama_models:

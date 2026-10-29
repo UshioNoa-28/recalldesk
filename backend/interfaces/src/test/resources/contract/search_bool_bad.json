@@ -1,0 +1,1 @@
+{"detail":[{"type":"bool_parsing","loc":["query","rewrite"],"msg":"Input should be a valid boolean, unable to interpret input","input":"maybe"}]}

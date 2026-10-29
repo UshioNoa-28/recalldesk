@@ -1,0 +1,16 @@
+# 构建上下文瘦身：Dockerfile 只需要 backend/ 的 pom 与源码，其余一律不进上下文
+.git
+.venv
+__pycache__
+*.pyc
+data
+doc
+examples
+frontend/node_modules
+frontend/dist
+reading_material
+plan.md
+.env
+.env.example
+opencode.json
+*.md
